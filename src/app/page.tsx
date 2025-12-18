@@ -14,12 +14,19 @@ import { toast } from 'sonner';
 import { logger } from '@/lib/logger';
 
 export default function Home() {
+  console.log('🏠 Home: Component rendering');
   const {
     isLoading: modelLoading,
     progress: modelProgress,
     error: modelError,
     isReady: modelReady,
   } = useModelLoader();
+  console.log('🏠 Home: Model state:', {
+    modelLoading,
+    modelProgress,
+    modelError,
+    modelReady,
+  });
   const {
     appState,
     originalImageUrl,
@@ -31,6 +38,7 @@ export default function Home() {
     setCleanedImage,
     reset,
   } = useAppStore();
+  console.log('🏠 Home: App state:', appState);
 
   // Update model progress in store
   useEffect(() => {

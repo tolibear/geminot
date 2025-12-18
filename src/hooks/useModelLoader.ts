@@ -25,19 +25,28 @@ export function useModelLoader() {
   });
 
   useEffect(() => {
+    console.log('🚀 useModelLoader: Effect triggered');
     let mounted = true;
 
     const loadModel = async () => {
       try {
+        console.log('🚀 useModelLoader: Starting model load');
         logger.info('Starting eager model download');
         const modelService = getModelService();
+        console.log('🚀 useModelLoader: Model service initialized');
 
         // Check if model is already cached
+        console.log(
+          '🚀 useModelLoader: Checking cache for',
+          INPAINTING_CONFIG.MODEL_URL
+        );
         const isCached = await modelService.isModelCached(
           INPAINTING_CONFIG.MODEL_URL
         );
+        console.log('🚀 useModelLoader: Cache check result:', isCached);
 
         if (isCached) {
+          console.log('🚀 useModelLoader: Model cached, loading instantly');
           logger.info('Model already cached, loading instantly');
           if (mounted) {
             setState({
@@ -51,9 +60,14 @@ export function useModelLoader() {
         }
 
         // Download model with progress tracking
+        console.log('🚀 useModelLoader: Starting download...');
         await modelService.downloadModel(
           INPAINTING_CONFIG.MODEL_URL,
           (progress: ModelDownloadProgress) => {
+            console.log(
+              '🚀 useModelLoader: Progress:',
+              progress.percentage + '%'
+            );
             if (mounted) {
               setState({
                 isLoading: true,
@@ -64,6 +78,7 @@ export function useModelLoader() {
             }
           }
         );
+        console.log('🚀 useModelLoader: Download complete!');
 
         if (mounted) {
           logger.info('Model download complete');
@@ -75,6 +90,7 @@ export function useModelLoader() {
           });
         }
       } catch (error) {
+        console.error('🚨 useModelLoader: Error occurred', error);
         logger.error('Model download failed', { error });
         if (mounted) {
           setState({
@@ -88,6 +104,7 @@ export function useModelLoader() {
       }
     };
 
+    console.log('🚀 useModelLoader: Calling loadModel()');
     loadModel();
 
     return () => {
