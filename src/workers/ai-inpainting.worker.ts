@@ -40,9 +40,10 @@ class AIInpaintingWorker implements InpaintingAPI {
 
     try {
       // Download model using fetch with progress tracking
-      const modelUrl = INPAINTING_CONFIG.MODEL_URL;
+      // Use the proxy API to avoid CORS issues with GitHub releases
+      const modelUrl = '/api/model-proxy';
 
-      console.log('[AI Worker] Downloading model from:', modelUrl);
+      console.log('[AI Worker] Downloading model via proxy...');
       const response = await fetch(modelUrl);
 
       if (!response.ok) {
@@ -168,12 +169,37 @@ class AIInpaintingWorker implements InpaintingAPI {
       const feeds = { image: imageTensor, mask: maskTensor };
       const results = await this.session.run(feeds);
 
-      // Get output tensor
-      const output = results.output || results[Object.keys(results)[0]];
+      // Get output tensor - try common output names
+      const outputKey = Object.keys(results)[0];
+      const output = results.output || results[outputKey];
 
-      // Post-process output
+      console.log('[AI Worker] Output tensor info:', {
+        outputKey,
+        dims: output.dims,
+        type: output.type,
+      });
+
+      // Debug: Check output value range
+      const outputData = output.data as Float32Array;
+      let min = Infinity,
+        max = -Infinity,
+        sum = 0;
+      for (let i = 0; i < Math.min(outputData.length, 10000); i++) {
+        min = Math.min(min, outputData[i]);
+        max = Math.max(max, outputData[i]);
+        sum += outputData[i];
+      }
+      console.log('[AI Worker] Output value range:', {
+        min: min.toFixed(4),
+        max: max.toFixed(4),
+        mean: (sum / Math.min(outputData.length, 10000)).toFixed(4),
+      });
+
+      // Post-process output and composite with original
       const resultImageData = this.postprocessOutput(
         output,
+        imageData,
+        maskData,
         originalWidth,
         originalHeight
       );
@@ -253,39 +279,102 @@ class AIInpaintingWorker implements InpaintingAPI {
 
   /**
    * Post-process model output back to ImageData
+   * Composites the inpainted result with the original image using the mask
    */
   private postprocessOutput(
     output: ort.Tensor,
+    originalImage: ImageData,
+    maskData: ImageData,
     originalWidth: number,
     originalHeight: number
   ): ImageData {
     const data = output.data as Float32Array;
     const [batch, channels, height, width] = output.dims;
 
-    // Create temporary canvas for model output
-    const tempImageData = new ImageData(width, height);
+    // Detect output value range
+    let min = Infinity,
+      max = -Infinity;
+    for (let i = 0; i < data.length; i++) {
+      min = Math.min(min, data[i]);
+      max = Math.max(max, data[i]);
+    }
+
+    console.log('[AI Worker] Normalizing output from range:', { min, max });
+
+    // Determine normalization strategy
+    // LaMa models typically output in [-1, 1] or [0, 1]
+    const normalize = (val: number): number => {
+      if (min >= 0 && max <= 1) {
+        // Already [0, 1] range
+        return val * 255;
+      } else if (min >= -1 && max <= 1) {
+        // [-1, 1] range -> [0, 255]
+        return ((val + 1) / 2) * 255;
+      } else if (max > 1 && max <= 255) {
+        // Already [0, 255] range (approximately)
+        return val;
+      } else {
+        // Unknown range - normalize to [0, 255]
+        return ((val - min) / (max - min)) * 255;
+      }
+    };
+
+    // Create temporary canvas for model output at model resolution
+    const modelImageData = new ImageData(width, height);
 
     // Convert from [1, 3, H, W] tensor to RGBA ImageData
     for (let i = 0; i < height * width; i++) {
       const pixelIndex = i * 4;
 
-      // Get RGB values and denormalize from [0, 1] to [0, 255]
-      const r = Math.max(0, Math.min(255, data[i] * 255));
-      const g = Math.max(0, Math.min(255, data[height * width + i] * 255));
-      const b = Math.max(0, Math.min(255, data[2 * height * width + i] * 255));
+      // Get RGB values and normalize
+      const r = Math.max(0, Math.min(255, normalize(data[i])));
+      const g = Math.max(0, Math.min(255, normalize(data[height * width + i])));
+      const b = Math.max(
+        0,
+        Math.min(255, normalize(data[2 * height * width + i]))
+      );
 
-      tempImageData.data[pixelIndex] = r;
-      tempImageData.data[pixelIndex + 1] = g;
-      tempImageData.data[pixelIndex + 2] = b;
-      tempImageData.data[pixelIndex + 3] = 255; // Alpha
+      modelImageData.data[pixelIndex] = r;
+      modelImageData.data[pixelIndex + 1] = g;
+      modelImageData.data[pixelIndex + 2] = b;
+      modelImageData.data[pixelIndex + 3] = 255; // Alpha
     }
 
-    // Resize back to original dimensions if needed
-    if (width !== originalWidth || height !== originalHeight) {
-      return this.resizeImageData(tempImageData, originalWidth, originalHeight);
+    // Resize model output to original dimensions
+    const resizedInpainted = this.resizeImageData(
+      modelImageData,
+      originalWidth,
+      originalHeight
+    );
+
+    // Composite: use inpainted result where mask is white, original elsewhere
+    const resultImageData = new ImageData(originalWidth, originalHeight);
+
+    for (let i = 0; i < originalWidth * originalHeight; i++) {
+      const pixelIndex = i * 4;
+
+      // Mask value (0 = keep original, 255 = use inpainted)
+      const maskValue = maskData.data[pixelIndex] / 255;
+
+      // Blend based on mask
+      resultImageData.data[pixelIndex] = Math.round(
+        originalImage.data[pixelIndex] * (1 - maskValue) +
+          resizedInpainted.data[pixelIndex] * maskValue
+      );
+      resultImageData.data[pixelIndex + 1] = Math.round(
+        originalImage.data[pixelIndex + 1] * (1 - maskValue) +
+          resizedInpainted.data[pixelIndex + 1] * maskValue
+      );
+      resultImageData.data[pixelIndex + 2] = Math.round(
+        originalImage.data[pixelIndex + 2] * (1 - maskValue) +
+          resizedInpainted.data[pixelIndex + 2] * maskValue
+      );
+      resultImageData.data[pixelIndex + 3] = 255; // Alpha
     }
 
-    return tempImageData;
+    console.log('[AI Worker] Composited result with original image');
+
+    return resultImageData;
   }
 
   /**

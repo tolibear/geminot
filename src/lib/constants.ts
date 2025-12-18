@@ -52,7 +52,9 @@ export const INPAINTING_CONFIG = {
     'https://github.com/tolibear/geminot/releases/download/v1.0.0/lama-small.onnx',
   MODEL_SIZE_MB: 88,
   INPUT_SIZE: 512,
-  USE_WEBGPU: true,
+  // WebGPU is disabled - has compatibility issues with this model's Add kernels
+  // WASM backend is more stable and works across all browsers
+  USE_WEBGPU: false,
   CACHE_NAME: 'ai-inpainting-models',
   CACHE_VERSION: 2, // Bumped for new model
   MASK_DILATION: 20, // Pixels to expand mask for better inpainting
