@@ -182,11 +182,23 @@ export class ModelService {
         return cached;
       }
 
-      // Download from URL
-      const response = await fetch(modelUrl);
+      // Download from URL with proper fetch options
+      const response = await fetch(modelUrl, {
+        method: 'GET',
+        headers: {
+          Accept: 'application/octet-stream',
+        },
+        // Follow redirects (default behavior)
+        redirect: 'follow',
+        // Use same-origin credentials
+        credentials: 'same-origin',
+      });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        const errorText = await response.text().catch(() => 'No error details');
+        throw new Error(
+          `HTTP error! status: ${response.status}, details: ${errorText}`
+        );
       }
 
       const contentLength = response.headers.get('content-length');
@@ -239,8 +251,17 @@ export class ModelService {
 
       return arrayBuffer;
     } catch (error) {
-      logger.error('Model download failed', { error, url: modelUrl });
-      throw error;
+      const errorMessage =
+        error instanceof Error ? error.message : String(error);
+      const errorDetails = {
+        error,
+        url: modelUrl,
+        message: errorMessage,
+        type:
+          error instanceof TypeError ? 'Network/CORS Error' : 'Unknown Error',
+      };
+      logger.error('Model download failed', errorDetails);
+      throw new Error(`Failed to download model: ${errorMessage}`);
     }
   }
 
