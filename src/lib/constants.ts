@@ -46,14 +46,14 @@ export const INPAINTING_STATUS = {
 } as const;
 
 export const INPAINTING_CONFIG = {
-  // Using a quantized LaMa model for efficient client-side inference
+  // Using OpenCV's optimized LaMa model for efficient client-side inference
   // Hosted on GitHub Releases for free CDN delivery
   MODEL_URL:
-    'https://github.com/tolibear/geminot/releases/download/v1.0.0/big-lama.onnx',
-  MODEL_SIZE_MB: 198,
+    'https://github.com/tolibear/geminot/releases/download/v1.0.0/lama-small.onnx',
+  MODEL_SIZE_MB: 88,
   INPUT_SIZE: 512,
   USE_WEBGPU: true,
   CACHE_NAME: 'ai-inpainting-models',
-  CACHE_VERSION: 1,
+  CACHE_VERSION: 2, // Bumped for new model
   MASK_DILATION: 20, // Pixels to expand mask for better inpainting
 } as const;
