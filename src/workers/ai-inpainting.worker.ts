@@ -144,14 +144,14 @@ class AIInpaintingWorker implements InpaintingAPI {
   }
 
   /**
-   * Perform inpainting on an image
+   * Perform patch-based inpainting on an image
    */
   async inpaint(imageData: ImageData, maskData: ImageData): Promise<ImageData> {
     if (!this.initialized || !this.session) {
       throw new Error('Worker not initialized');
     }
 
-    console.log('[AI Worker] Starting inpainting...', {
+    console.log('[AI Worker] Starting patch-based inpainting...', {
       imageSize: `${imageData.width}x${imageData.height}`,
       maskSize: `${maskData.width}x${maskData.height}`,
       provider: this.config.executionProvider,
@@ -160,12 +160,19 @@ class AIInpaintingWorker implements InpaintingAPI {
     try {
       const startTime = performance.now();
 
-      // Prepare input tensors
-      const { imageTensor, maskTensor, originalWidth, originalHeight } =
-        this.preprocessInputs(imageData, maskData);
+      // Extract watermark patch with context padding
+      const patchInfo = this.extractWatermarkPatch(imageData, maskData);
+      console.log('[AI Worker] Extracted patch:', {
+        patchSize: `${patchInfo.patchImage.width}x${patchInfo.patchImage.height}`,
+        offset: `${patchInfo.offsetX}, ${patchInfo.offsetY}`,
+      });
 
-      // Run inference
-      console.log('[AI Worker] Running inference...');
+      // Prepare input tensors from patch
+      const { imageTensor, maskTensor, originalWidth, originalHeight } =
+        this.preprocessInputs(patchInfo.patchImage, patchInfo.patchMask);
+
+      // Run inference on patch
+      console.log('[AI Worker] Running inference on patch...');
       const feeds = { image: imageTensor, mask: maskTensor };
       const results = await this.session.run(feeds);
 
@@ -179,33 +186,32 @@ class AIInpaintingWorker implements InpaintingAPI {
         type: output.type,
       });
 
-      // Debug: Check output value range
-      const outputData = output.data as Float32Array;
-      let min = Infinity,
-        max = -Infinity,
-        sum = 0;
-      for (let i = 0; i < Math.min(outputData.length, 10000); i++) {
-        min = Math.min(min, outputData[i]);
-        max = Math.max(max, outputData[i]);
-        sum += outputData[i];
-      }
-      console.log('[AI Worker] Output value range:', {
-        min: min.toFixed(4),
-        max: max.toFixed(4),
-        mean: (sum / Math.min(outputData.length, 10000)).toFixed(4),
-      });
-
-      // Post-process output and composite with original
-      const resultImageData = this.postprocessOutput(
+      // Post-process patch output
+      const inpaintedPatch = this.postprocessPatchOutput(
         output,
-        imageData,
-        maskData,
+        patchInfo.patchImage,
         originalWidth,
         originalHeight
       );
 
+      // Validate output quality
+      if (!this.validateInpaintingResult(inpaintedPatch)) {
+        console.warn(
+          '[AI Worker] Output validation failed, quality may be poor'
+        );
+      }
+
+      // Composite patch back into original image
+      const resultImageData = this.compositePatchToImage(
+        imageData,
+        inpaintedPatch,
+        patchInfo.patchMask,
+        patchInfo.offsetX,
+        patchInfo.offsetY
+      );
+
       const elapsed = performance.now() - startTime;
-      console.log('[AI Worker] Inpainting complete', {
+      console.log('[AI Worker] Patch-based inpainting complete', {
         timeMs: elapsed.toFixed(0),
         timeSec: (elapsed / 1000).toFixed(2),
       });
@@ -218,7 +224,115 @@ class AIInpaintingWorker implements InpaintingAPI {
   }
 
   /**
+   * Extract watermark patch with context padding
+   */
+  private extractWatermarkPatch(
+    imageData: ImageData,
+    maskData: ImageData
+  ): {
+    patchImage: ImageData;
+    patchMask: ImageData;
+    offsetX: number;
+    offsetY: number;
+  } {
+    const { width, height } = imageData;
+
+    // Find bounding box of mask (white pixels)
+    let minX = width,
+      minY = height,
+      maxX = 0,
+      maxY = 0;
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * 4;
+        if (maskData.data[idx] > 128) {
+          // White pixel
+          minX = Math.min(minX, x);
+          minY = Math.min(minY, y);
+          maxX = Math.max(maxX, x);
+          maxY = Math.max(maxY, y);
+        }
+      }
+    }
+
+    // Add padding for context
+    const padding = INPAINTING_CONFIG.PATCH_PADDING;
+    const patchX = Math.max(0, minX - padding);
+    const patchY = Math.max(0, minY - padding);
+    const patchWidth = Math.min(width - patchX, maxX - minX + padding * 2);
+    const patchHeight = Math.min(height - patchY, maxY - minY + padding * 2);
+
+    console.log('[AI Worker] Patch bounds:', {
+      maskBounds: `${minX},${minY} to ${maxX},${maxY}`,
+      patchBounds: `${patchX},${patchY} size ${patchWidth}x${patchHeight}`,
+      padding,
+    });
+
+    // Extract patch from image
+    const patchCanvas = new OffscreenCanvas(patchWidth, patchHeight);
+    const patchCtx = patchCanvas.getContext('2d');
+    if (!patchCtx) {
+      throw new Error('Failed to get patch canvas context');
+    }
+
+    // Draw image patch
+    const sourceCanvas = new OffscreenCanvas(width, height);
+    const sourceCtx = sourceCanvas.getContext('2d');
+    if (!sourceCtx) {
+      throw new Error('Failed to get source canvas context');
+    }
+    sourceCtx.putImageData(imageData, 0, 0);
+    patchCtx.drawImage(
+      sourceCanvas,
+      patchX,
+      patchY,
+      patchWidth,
+      patchHeight,
+      0,
+      0,
+      patchWidth,
+      patchHeight
+    );
+    const patchImage = patchCtx.getImageData(0, 0, patchWidth, patchHeight);
+
+    // Extract patch from mask
+    const maskCanvas = new OffscreenCanvas(width, height);
+    const maskCtx = maskCanvas.getContext('2d');
+    if (!maskCtx) {
+      throw new Error('Failed to get mask canvas context');
+    }
+    maskCtx.putImageData(maskData, 0, 0);
+
+    const patchMaskCanvas = new OffscreenCanvas(patchWidth, patchHeight);
+    const patchMaskCtx = patchMaskCanvas.getContext('2d');
+    if (!patchMaskCtx) {
+      throw new Error('Failed to get patch mask canvas context');
+    }
+    patchMaskCtx.drawImage(
+      maskCanvas,
+      patchX,
+      patchY,
+      patchWidth,
+      patchHeight,
+      0,
+      0,
+      patchWidth,
+      patchHeight
+    );
+    const patchMask = patchMaskCtx.getImageData(0, 0, patchWidth, patchHeight);
+
+    return {
+      patchImage,
+      patchMask,
+      offsetX: patchX,
+      offsetY: patchY,
+    };
+  }
+
+  /**
    * Preprocess image and mask for model input
+   * LaMa expects: masked image (areas to inpaint are black) + mask
    */
   private preprocessInputs(
     imageData: ImageData,
@@ -245,21 +359,34 @@ class AIInpaintingWorker implements InpaintingAPI {
     const imageArray = new Float32Array(3 * targetSize * targetSize);
     const maskArray = new Float32Array(1 * targetSize * targetSize);
 
-    // Image: convert RGBA to RGB, normalize to [0, 1], shape [1, 3, H, W]
+    // LaMa expects "masked image" where mask areas are BLACK (zeroed out)
+    // This tells the model WHERE to fill in content
     for (let i = 0; i < targetSize * targetSize; i++) {
       const pixelIndex = i * 4;
       const tensorIndex = i;
 
-      // RGB channels
-      imageArray[tensorIndex] = resizedImage.data[pixelIndex] / 255.0; // R
-      imageArray[targetSize * targetSize + tensorIndex] =
-        resizedImage.data[pixelIndex + 1] / 255.0; // G
-      imageArray[2 * targetSize * targetSize + tensorIndex] =
-        resizedImage.data[pixelIndex + 2] / 255.0; // B
+      // Get mask value (0 = keep, 1 = inpaint)
+      const maskValue = resizedMask.data[pixelIndex] / 255.0;
 
-      // Mask: single channel, normalized
-      maskArray[tensorIndex] = resizedMask.data[pixelIndex] / 255.0;
+      // Create masked image: original * (1 - mask)
+      // Areas to inpaint become BLACK in the input image
+      const keepFactor = 1.0 - maskValue;
+
+      // RGB channels - black out masked areas
+      imageArray[tensorIndex] =
+        (resizedImage.data[pixelIndex] / 255.0) * keepFactor; // R
+      imageArray[targetSize * targetSize + tensorIndex] =
+        (resizedImage.data[pixelIndex + 1] / 255.0) * keepFactor; // G
+      imageArray[2 * targetSize * targetSize + tensorIndex] =
+        (resizedImage.data[pixelIndex + 2] / 255.0) * keepFactor; // B
+
+      // Mask: single channel, normalized (1 = area to fill)
+      maskArray[tensorIndex] = maskValue;
     }
+
+    console.log(
+      '[AI Worker] Created masked image input (masked areas are black)'
+    );
 
     const imageTensor = new ort.Tensor('float32', imageArray, [
       1,
@@ -278,13 +405,11 @@ class AIInpaintingWorker implements InpaintingAPI {
   }
 
   /**
-   * Post-process model output back to ImageData
-   * Composites the inpainted result with the original image using the mask
+   * Post-process patch model output back to ImageData
    */
-  private postprocessOutput(
+  private postprocessPatchOutput(
     output: ort.Tensor,
-    originalImage: ImageData,
-    maskData: ImageData,
+    originalPatchImage: ImageData,
     originalWidth: number,
     originalHeight: number
   ): ImageData {
@@ -299,24 +424,33 @@ class AIInpaintingWorker implements InpaintingAPI {
       max = Math.max(max, data[i]);
     }
 
-    console.log('[AI Worker] Normalizing output from range:', { min, max });
+    console.log('[AI Worker] Output value range:', { min, max });
 
-    // Determine normalization strategy
-    // LaMa models typically output in [-1, 1] or [0, 1]
+    // Smart normalization based on output range
     const normalize = (val: number): number => {
-      if (min >= 0 && max <= 1) {
-        // Already [0, 1] range
-        return val * 255;
-      } else if (min >= -1 && max <= 1) {
-        // [-1, 1] range -> [0, 255]
-        return ((val + 1) / 2) * 255;
-      } else if (max > 1 && max <= 255) {
-        // Already [0, 255] range (approximately)
-        return val;
-      } else {
-        // Unknown range - normalize to [0, 255]
-        return ((val - min) / (max - min)) * 255;
+      if (max === min) {
+        // Avoid division by zero - solid color output
+        return 128;
       }
+
+      // If output is already in ~[0, 255] range, use directly with clamping
+      // This preserves original color values better
+      if (min >= -10 && max <= 265 && max - min > 100) {
+        return Math.max(0, Math.min(255, val));
+      }
+
+      // If output is in [0, 1] range
+      if (min >= -0.1 && max <= 1.1) {
+        return Math.max(0, Math.min(255, val * 255));
+      }
+
+      // If output is in [-1, 1] range
+      if (min >= -1.1 && max <= 1.1) {
+        return Math.max(0, Math.min(255, ((val + 1) / 2) * 255));
+      }
+
+      // Otherwise use min-max normalization
+      return ((val - min) / (max - min)) * 255;
     };
 
     // Create temporary canvas for model output at model resolution
@@ -340,41 +474,136 @@ class AIInpaintingWorker implements InpaintingAPI {
       modelImageData.data[pixelIndex + 3] = 255; // Alpha
     }
 
-    // Resize model output to original dimensions
+    // Resize model output to original patch dimensions
     const resizedInpainted = this.resizeImageData(
       modelImageData,
       originalWidth,
       originalHeight
     );
 
-    // Composite: use inpainted result where mask is white, original elsewhere
-    const resultImageData = new ImageData(originalWidth, originalHeight);
+    console.log('[AI Worker] Resized inpainted patch to original dimensions');
 
-    for (let i = 0; i < originalWidth * originalHeight; i++) {
-      const pixelIndex = i * 4;
+    return resizedInpainted;
+  }
 
-      // Mask value (0 = keep original, 255 = use inpainted)
-      const maskValue = maskData.data[pixelIndex] / 255;
+  /**
+   * Composite inpainted patch back into original image with feathered blending
+   */
+  private compositePatchToImage(
+    originalImage: ImageData,
+    inpaintedPatch: ImageData,
+    patchMask: ImageData,
+    offsetX: number,
+    offsetY: number
+  ): ImageData {
+    const resultImageData = new ImageData(
+      originalImage.width,
+      originalImage.height
+    );
 
-      // Blend based on mask
-      resultImageData.data[pixelIndex] = Math.round(
-        originalImage.data[pixelIndex] * (1 - maskValue) +
-          resizedInpainted.data[pixelIndex] * maskValue
-      );
-      resultImageData.data[pixelIndex + 1] = Math.round(
-        originalImage.data[pixelIndex + 1] * (1 - maskValue) +
-          resizedInpainted.data[pixelIndex + 1] * maskValue
-      );
-      resultImageData.data[pixelIndex + 2] = Math.round(
-        originalImage.data[pixelIndex + 2] * (1 - maskValue) +
-          resizedInpainted.data[pixelIndex + 2] * maskValue
-      );
-      resultImageData.data[pixelIndex + 3] = 255; // Alpha
+    // Copy original image
+    resultImageData.data.set(originalImage.data);
+
+    // Blend inpainted patch into result using feathered mask
+    const patchWidth = inpaintedPatch.width;
+    const patchHeight = inpaintedPatch.height;
+
+    for (let py = 0; py < patchHeight; py++) {
+      for (let px = 0; px < patchWidth; px++) {
+        const imageX = offsetX + px;
+        const imageY = offsetY + py;
+
+        // Skip if outside image bounds
+        if (
+          imageX < 0 ||
+          imageX >= originalImage.width ||
+          imageY < 0 ||
+          imageY >= originalImage.height
+        ) {
+          continue;
+        }
+
+        const patchIdx = (py * patchWidth + px) * 4;
+        const imageIdx = (imageY * originalImage.width + imageX) * 4;
+
+        // Get mask value (feathered, 0-255)
+        const maskValue = patchMask.data[patchIdx] / 255;
+
+        // Alpha blend: result = original * (1 - alpha) + inpainted * alpha
+        resultImageData.data[imageIdx] = Math.round(
+          originalImage.data[imageIdx] * (1 - maskValue) +
+            inpaintedPatch.data[patchIdx] * maskValue
+        );
+        resultImageData.data[imageIdx + 1] = Math.round(
+          originalImage.data[imageIdx + 1] * (1 - maskValue) +
+            inpaintedPatch.data[patchIdx + 1] * maskValue
+        );
+        resultImageData.data[imageIdx + 2] = Math.round(
+          originalImage.data[imageIdx + 2] * (1 - maskValue) +
+            inpaintedPatch.data[patchIdx + 2] * maskValue
+        );
+        resultImageData.data[imageIdx + 3] = 255; // Alpha
+      }
     }
 
-    console.log('[AI Worker] Composited result with original image');
+    console.log(
+      '[AI Worker] Composited patch into original image with feathering'
+    );
 
     return resultImageData;
+  }
+
+  /**
+   * Validate inpainting result quality
+   * Detects failures like solid-color outputs
+   */
+  private validateInpaintingResult(imageData: ImageData): boolean {
+    const { width, height, data } = imageData;
+    const totalPixels = width * height;
+
+    // Calculate color variance
+    let rSum = 0,
+      gSum = 0,
+      bSum = 0;
+
+    for (let i = 0; i < totalPixels; i++) {
+      const idx = i * 4;
+      rSum += data[idx];
+      gSum += data[idx + 1];
+      bSum += data[idx + 2];
+    }
+
+    const rMean = rSum / totalPixels;
+    const gMean = gSum / totalPixels;
+    const bMean = bSum / totalPixels;
+
+    // Calculate variance
+    let rVariance = 0,
+      gVariance = 0,
+      bVariance = 0;
+
+    for (let i = 0; i < totalPixels; i++) {
+      const idx = i * 4;
+      rVariance += Math.pow(data[idx] - rMean, 2);
+      gVariance += Math.pow(data[idx + 1] - gMean, 2);
+      bVariance += Math.pow(data[idx + 2] - bMean, 2);
+    }
+
+    rVariance /= totalPixels;
+    gVariance /= totalPixels;
+    bVariance /= totalPixels;
+
+    const totalVariance = rVariance + gVariance + bVariance;
+
+    console.log('[AI Worker] Output quality check:', {
+      mean: `R:${rMean.toFixed(1)} G:${gMean.toFixed(1)} B:${bMean.toFixed(1)}`,
+      variance: totalVariance.toFixed(1),
+      threshold: INPAINTING_CONFIG.MIN_OUTPUT_VARIANCE,
+      passed: totalVariance >= INPAINTING_CONFIG.MIN_OUTPUT_VARIANCE,
+    });
+
+    // If variance is too low, output is likely solid color (failed inpainting)
+    return totalVariance >= INPAINTING_CONFIG.MIN_OUTPUT_VARIANCE;
   }
 
   /**

@@ -57,5 +57,10 @@ export const INPAINTING_CONFIG = {
   USE_WEBGPU: false,
   CACHE_NAME: 'ai-inpainting-models',
   CACHE_VERSION: 2, // Bumped for new model
-  MASK_DILATION: 20, // Pixels to expand mask for better inpainting
+  MASK_DILATION: 10, // Pixels to expand mask around star
+  BADGE_SIZE_ESTIMATE: 50, // Star watermark size (~50px)
+  // Patch-based inpainting config for better quality
+  PATCH_PADDING: 100, // Context pixels for good texture sampling
+  MASK_FEATHER_RADIUS: 40, // Large feather for seamless blending into background
+  MIN_OUTPUT_VARIANCE: 500, // Threshold for detecting solid-color failures
 } as const;

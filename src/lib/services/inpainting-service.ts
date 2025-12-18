@@ -10,12 +10,29 @@ type AIInpaintingWorker = {
   cleanup(): void;
 };
 
+type DetectionWorker = {
+  initialize(): Promise<void>;
+  detectBadge(imageData: ImageData): Promise<DetectionResult | null>;
+  isInitialized(): boolean;
+  cleanup(): void;
+};
+
+interface DetectionResult {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  confidence: number;
+}
+
 /**
  * Service for handling badge inpainting using AI
  */
 export class InpaintingService {
   private aiWorker: Worker | null = null;
   private aiApi: Remote<AIInpaintingWorker> | null = null;
+  private detectionWorker: Worker | null = null;
+  private detectionApi: Remote<DetectionWorker> | null = null;
 
   /**
    * Initialize the AI inpainting worker
@@ -48,6 +65,40 @@ export class InpaintingService {
       logger.error('Failed to initialize AI worker', { error });
       throw new Error(
         `AI worker initialization failed: ${error instanceof Error ? error.message : 'Unknown error'}`
+      );
+    }
+  }
+
+  /**
+   * Initialize the detection worker
+   */
+  private async ensureDetectionWorker(): Promise<Remote<DetectionWorker>> {
+    if (this.detectionApi) {
+      // Check if already initialized
+      const isInit = await this.detectionApi.isInitialized();
+      if (isInit) {
+        return this.detectionApi;
+      }
+    }
+
+    logger.info('Initializing detection worker');
+
+    try {
+      this.detectionWorker = new Worker(
+        new URL('@/workers/detection.worker.ts', import.meta.url),
+        { type: 'module' }
+      );
+
+      this.detectionApi = wrap<DetectionWorker>(this.detectionWorker);
+
+      await this.detectionApi.initialize();
+
+      logger.info('Detection worker initialized successfully');
+      return this.detectionApi;
+    } catch (error) {
+      logger.error('Failed to initialize detection worker', { error });
+      throw new Error(
+        `Detection worker initialization failed: ${error instanceof Error ? error.message : 'Unknown error'}`
       );
     }
   }
@@ -104,7 +155,7 @@ export class InpaintingService {
   }
 
   /**
-   * Create a mask for the badge region
+   * Create a feathered mask for the badge region with smooth edges
    */
   private createMask(imageData: ImageData, file: ProcessedFile): ImageData {
     const { width, height } = imageData;
@@ -160,7 +211,94 @@ export class InpaintingService {
     maskCtx.fillStyle = 'white';
     maskCtx.fillRect(maskX, maskY, maskWidth, maskHeight);
 
-    return maskCtx.getImageData(0, 0, width, height);
+    // Apply Gaussian blur for feathered edges
+    const maskImageData = maskCtx.getImageData(0, 0, width, height);
+    return this.applyGaussianBlur(
+      maskImageData,
+      INPAINTING_CONFIG.MASK_FEATHER_RADIUS
+    );
+  }
+
+  /**
+   * Apply Gaussian blur to create feathered mask edges
+   */
+  private applyGaussianBlur(imageData: ImageData, radius: number): ImageData {
+    const { width, height, data } = imageData;
+    const output = new ImageData(width, height);
+
+    // Create Gaussian kernel
+    const kernel = this.createGaussianKernel(radius);
+    const kernelSize = kernel.length;
+    const halfKernel = Math.floor(kernelSize / 2);
+
+    // Apply horizontal blur
+    const temp = new Uint8ClampedArray(data.length);
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let sum = 0;
+        let weightSum = 0;
+
+        for (let kx = -halfKernel; kx <= halfKernel; kx++) {
+          const sx = Math.min(Math.max(x + kx, 0), width - 1);
+          const weight = kernel[kx + halfKernel];
+          const idx = (y * width + sx) * 4;
+          sum += data[idx] * weight; // Use R channel (grayscale mask)
+          weightSum += weight;
+        }
+
+        const idx = (y * width + x) * 4;
+        const value = Math.round(sum / weightSum);
+        temp[idx] = value;
+        temp[idx + 1] = value;
+        temp[idx + 2] = value;
+        temp[idx + 3] = 255;
+      }
+    }
+
+    // Apply vertical blur
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        let sum = 0;
+        let weightSum = 0;
+
+        for (let ky = -halfKernel; ky <= halfKernel; ky++) {
+          const sy = Math.min(Math.max(y + ky, 0), height - 1);
+          const weight = kernel[ky + halfKernel];
+          const idx = (sy * width + x) * 4;
+          sum += temp[idx] * weight;
+          weightSum += weight;
+        }
+
+        const idx = (y * width + x) * 4;
+        const value = Math.round(sum / weightSum);
+        output.data[idx] = value;
+        output.data[idx + 1] = value;
+        output.data[idx + 2] = value;
+        output.data[idx + 3] = 255;
+      }
+    }
+
+    return output;
+  }
+
+  /**
+   * Create 1D Gaussian kernel
+   */
+  private createGaussianKernel(radius: number): number[] {
+    const sigma = radius / 3;
+    const size = radius * 2 + 1;
+    const kernel: number[] = [];
+    let sum = 0;
+
+    for (let i = 0; i < size; i++) {
+      const x = i - radius;
+      const value = Math.exp(-(x * x) / (2 * sigma * sigma));
+      kernel.push(value);
+      sum += value;
+    }
+
+    // Normalize
+    return kernel.map((v) => v / sum);
   }
 
   /**
@@ -186,10 +324,10 @@ export class InpaintingService {
   }
 
   /**
-   * Inpaint an image blob (simplified - no detection, always bottom-right corner)
+   * Inpaint an image blob with fixed-position star watermark removal
    */
   async inpaintImage(imageBlob: Blob): Promise<Blob> {
-    logger.info('Starting simplified inpainting');
+    logger.info('Starting watermark removal (fixed position)');
 
     try {
       // Load the image
@@ -208,11 +346,11 @@ export class InpaintingService {
       // Get AI worker
       const aiApi = await this.ensureAIWorker();
 
-      // Create mask for bottom-right corner (typical watermark location)
-      const maskData = this.createSimpleMask(imageData);
+      // Create mask for fixed-position watermark in bottom-right
+      const maskData = this.createFixedPositionMask(imageData);
 
       // Perform AI inpainting
-      logger.info('Running AI inpainting on bottom-right corner');
+      logger.info('Running AI inpainting on fixed watermark position');
       const inpaintedData = await aiApi.inpaint(imageData, maskData);
 
       // Convert to blob
@@ -221,19 +359,19 @@ export class InpaintingService {
         imageBlob.type || 'image/png'
       );
 
-      logger.info('Simplified inpainting successful', { blobSize: blob.size });
+      logger.info('Watermark removal successful', { blobSize: blob.size });
 
       return blob;
     } catch (error) {
-      logger.error('Simplified inpainting failed', { error });
+      logger.error('Watermark removal failed', { error });
       throw error;
     }
   }
 
   /**
-   * Create a mask for the bottom-right corner (where watermarks typically are)
+   * Create a feathered mask for fixed-position watermark in bottom-right corner
    */
-  private createSimpleMask(imageData: ImageData): ImageData {
+  private createFixedPositionMask(imageData: ImageData): ImageData {
     const { width, height } = imageData;
     const maskCanvas = new OffscreenCanvas(width, height);
     const maskCtx = maskCanvas.getContext('2d');
@@ -246,25 +384,50 @@ export class InpaintingService {
     maskCtx.fillStyle = 'black';
     maskCtx.fillRect(0, 0, width, height);
 
-    // Calculate bottom-right corner region (15% of image dimensions)
-    const regionPercent = DETECTION_CONFIG.ROI_PERCENT;
-    const regionWidth = Math.floor(width * regionPercent);
-    const regionHeight = Math.floor(height * regionPercent);
-    const regionX = width - regionWidth;
-    const regionY = height - regionHeight;
-
-    // Add dilation for smoother inpainting
+    // Star watermark position - very close to corner
+    // The star center appears to be ~18px from right edge, ~18px from bottom edge
+    const starCenterFromRight = 120;
+    const starCenterFromBottom = 120;
+    const starRadius = 80; // Half the star size (~44px total)
     const dilation = INPAINTING_CONFIG.MASK_DILATION;
-    const maskX = Math.max(0, regionX - dilation);
-    const maskY = Math.max(0, regionY - dilation);
-    const maskWidth = Math.min(width - maskX, regionWidth + dilation * 2);
-    const maskHeight = Math.min(height - maskY, regionHeight + dilation * 2);
 
-    // Draw white rectangle for inpainting region (white = inpaint)
+    // Calculate mask centered on the star
+    const maskRadius = starRadius + dilation;
+    const centerX = width - starCenterFromRight;
+    const centerY = height - starCenterFromBottom;
+
+    const maskX = Math.max(0, centerX - maskRadius);
+    const maskY = Math.max(0, centerY - maskRadius);
+    const maskWidth = Math.min(width - maskX, maskRadius * 2);
+    const maskHeight = Math.min(height - maskY, maskRadius * 2);
+
+    logger.info('Creating centered mask over star watermark', {
+      imageSize: `${width}x${height}`,
+      starCenter: `${centerX}, ${centerY}`,
+      maskPosition: `${maskX}, ${maskY}`,
+      maskSize: `${maskWidth}x${maskHeight}`,
+    });
+
+    // Draw white circle/ellipse for more natural star coverage
     maskCtx.fillStyle = 'white';
-    maskCtx.fillRect(maskX, maskY, maskWidth, maskHeight);
+    maskCtx.beginPath();
+    maskCtx.ellipse(
+      centerX,
+      centerY,
+      maskRadius,
+      maskRadius,
+      0,
+      0,
+      Math.PI * 2
+    );
+    maskCtx.fill();
 
-    return maskCtx.getImageData(0, 0, width, height);
+    // Apply Gaussian blur for feathered edges (larger for better blending)
+    const maskImageData = maskCtx.getImageData(0, 0, width, height);
+    return this.applyGaussianBlur(
+      maskImageData,
+      INPAINTING_CONFIG.MASK_FEATHER_RADIUS
+    );
   }
 
   /**
@@ -283,6 +446,12 @@ export class InpaintingService {
       this.aiWorker = null;
       this.aiApi = null;
       logger.info('AI inpainting worker terminated');
+    }
+    if (this.detectionWorker) {
+      this.detectionWorker.terminate();
+      this.detectionWorker = null;
+      this.detectionApi = null;
+      logger.info('Detection worker terminated');
     }
   }
 }
