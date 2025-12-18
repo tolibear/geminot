@@ -23,28 +23,39 @@ export class ModelService {
    */
   private async initDB(): Promise<IDBDatabase> {
     if (this.db) {
+      console.log('💾 initDB: Using cached DB instance');
       return this.db;
     }
 
+    console.log(
+      '💾 initDB: Opening IndexedDB',
+      this.dbName,
+      'version',
+      this.dbVersion
+    );
     return new Promise((resolve, reject) => {
       const request = indexedDB.open(this.dbName, this.dbVersion);
 
       request.onerror = () => {
+        console.error('💾 initDB: Error opening DB', request.error);
         logger.error('Failed to open IndexedDB', { error: request.error });
         reject(request.error);
       };
 
       request.onsuccess = () => {
+        console.log('💾 initDB: DB opened successfully');
         this.db = request.result;
         logger.info('IndexedDB opened successfully');
         resolve(request.result);
       };
 
       request.onupgradeneeded = (event) => {
+        console.log('💾 initDB: DB upgrade needed');
         const db = (event.target as IDBOpenDBRequest).result;
 
         // Create object store if it doesn't exist
         if (!db.objectStoreNames.contains(this.storeName)) {
+          console.log('💾 initDB: Creating object store', this.storeName);
           const objectStore = db.createObjectStore(this.storeName, {
             keyPath: 'url',
           });
@@ -60,23 +71,35 @@ export class ModelService {
    */
   async isModelCached(modelUrl: string): Promise<boolean> {
     try {
+      console.log('💾 isModelCached: Starting cache check');
       const db = await this.initDB();
+      console.log('💾 isModelCached: DB initialized');
 
       return new Promise((resolve, reject) => {
+        console.log('💾 isModelCached: Creating transaction');
         const transaction = db.transaction([this.storeName], 'readonly');
         const store = transaction.objectStore(this.storeName);
         const request = store.get(modelUrl);
 
         request.onsuccess = () => {
+          console.log('💾 isModelCached: Success, result:', !!request.result);
           resolve(!!request.result);
         };
 
         request.onerror = () => {
+          console.error('💾 isModelCached: Error', request.error);
           logger.error('Error checking cache', { error: request.error });
           reject(request.error);
         };
+
+        // Add timeout to prevent hanging
+        setTimeout(() => {
+          console.error('💾 isModelCached: Timeout after 5 seconds');
+          resolve(false); // Assume not cached on timeout
+        }, 5000);
       });
     } catch (error) {
+      console.error('💾 isModelCached: Exception caught', error);
       logger.error('Failed to check model cache', { error });
       return false;
     }
