@@ -49,7 +49,7 @@ export const INPAINTING_CONFIG = {
   // Using a quantized LaMa model for efficient client-side inference
   // Hosted on GitHub Releases for free CDN delivery
   MODEL_URL:
-    'https://github.com/toli/geminot/releases/download/v1.0.0/big-lama.onnx',
+    'https://github.com/tolibear/geminot/releases/download/v1.0.0/big-lama.onnx',
   MODEL_SIZE_MB: 198,
   INPUT_SIZE: 512,
   USE_WEBGPU: true,
